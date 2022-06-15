@@ -1555,7 +1555,10 @@ void DynamicData::set_default_value(
             uint64_t value(0);
             try
             {
-                value = stoul(defaultValue);
+                if (defaultValue != "")
+                {
+                    value = stoul(defaultValue);
+                }
             }
             catch (...)
             {
@@ -1581,7 +1584,12 @@ void DynamicData::set_default_value(
             double value(0.0f);
             try
             {
-                value = stod(defaultValue);
+                if (defaultValue != "")
+                {
+                    value = stod(defaultValue);
+                }
+                
+                
             }
             catch (...)
             {
