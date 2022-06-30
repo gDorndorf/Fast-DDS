@@ -1195,27 +1195,25 @@ void PDP::check_and_notify_type_discovery(
         listener->on_type_information_received(
             mp_RTPSParticipant->getUserRTPSParticipant(), topic_name, type_name, type_info->type_information);
     }
-
-    // Are we discovering a type?
-    types::DynamicType_ptr dyn_type;
-    if (type_obj && type_obj->_d() == types::EK_COMPLETE) // Writer shares a Complete TypeObject
+    if (!mp_RTPSParticipant->check_type(type_name.to_string()))
     {
-        dyn_type = types::TypeObjectFactory::get_instance()->build_dynamic_type(
-            type_name.to_string(), type_id, type_obj);
-    }
-    else if (type_id && type_id->_d() != static_cast<octet>(0x00)
-            && type_id->_d() < types::EK_MINIMAL) // Writer shares a TypeIdentifier that doesn't need TypeObject
-    {
-        dyn_type = types::TypeObjectFactory::get_instance()->build_dynamic_type(
-            type_name.to_string(), type_id);
-    }
-
-    if (dyn_type != nullptr)
-    {
-        types::DynamicPubSubType type_support(dyn_type);
-
-        if (!mp_RTPSParticipant->check_type(type_name.to_string()))
+        // Are we discovering a type?
+        types::DynamicType_ptr dyn_type;
+        if (type_obj && type_obj->_d() == types::EK_COMPLETE) // Writer shares a Complete TypeObject
         {
+            dyn_type = types::TypeObjectFactory::get_instance()->build_dynamic_type(
+                type_name.to_string(), type_id, type_obj);
+        }
+        else if (type_id && type_id->_d() != static_cast<octet>(0x00)
+                && type_id->_d() < types::EK_MINIMAL) // Writer shares a TypeIdentifier that doesn't need TypeObject
+        {
+            dyn_type = types::TypeObjectFactory::get_instance()->build_dynamic_type(
+                type_name.to_string(), type_id);
+        }
+
+        if (dyn_type != nullptr)
+        {
+            types::DynamicPubSubType type_support(dyn_type);
             // Discovering a type
             listener->on_type_discovery(
                 mp_RTPSParticipant->getUserRTPSParticipant(),
