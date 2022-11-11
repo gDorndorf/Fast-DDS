@@ -352,6 +352,11 @@ public:
         return *datareader_;
     }
 
+    eprosima::fastdds::dds::Subscriber& get_native_subscriber() const
+    {
+        return *subscriber_;
+    }
+
     void init()
     {
         ASSERT_FALSE(initialized_);
@@ -473,7 +478,7 @@ public:
     }
 
     eprosima::fastrtps::rtps::SequenceNumber_t startReception(
-            std::list<type>& msgs)
+            const std::list<type>& msgs)
     {
         mutex_.lock();
         total_msgs_ = msgs;
@@ -1285,6 +1290,21 @@ public:
     {
         participant_qos_.wire_protocol().builtin.discovery_config.leaseDuration = lease_duration;
         participant_qos_.wire_protocol().builtin.discovery_config.leaseDuration_announcementperiod = announce_period;
+        return *this;
+    }
+
+    PubSubReader& initial_announcements(
+            uint32_t count,
+            const eprosima::fastrtps::Duration_t& period)
+    {
+        participant_qos_.wire_protocol().builtin.discovery_config.initial_announcements.count = count;
+        participant_qos_.wire_protocol().builtin.discovery_config.initial_announcements.period = period;
+        return *this;
+    }
+
+    PubSubReader& ownership_exclusive()
+    {
+        datareader_qos_.ownership().kind = eprosima::fastdds::dds::EXCLUSIVE_OWNERSHIP_QOS;
         return *this;
     }
 

@@ -15,7 +15,7 @@ at any time.
 
 Disclaimer:
 
-* This section has been last updated in March 2022.
+* This section has been last updated in September 2022.
   Please take into account its content could be obsolete.
 
 ## Short term
@@ -23,17 +23,9 @@ Disclaimer:
 The following list of features are planned to be addressed in the short term, and incorporated into the following
 minor release of the product:
 
-* Content filtered topic support on DataWriter
 * Complete support for dynamic network interfaces
-* ReadCondition implementation
 * Secure Discovery Server
-* DataReader, DataWriter and DomainParticipant DDS API implementation:
-    - `DataReader::get_sample_lost_status`
-    - `DataReader::lookup_instance`
-    - `DataWriter::get_key_value`
-    - `DataWriter::write_w_timestamp`
-    - `DomainParticipant::find_topic`
-* Android support
+* Support for Time-based filter QoS
 
 ## Medium term
 

@@ -184,6 +184,7 @@ bool StatefulReader::matched_writer_add(
         const WriterProxyData& wdata)
 {
     assert(wdata.guid() != c_Guid_Unknown);
+    ReaderListener* listener = nullptr;
 
     {
         std::unique_lock<RecursiveTimedMutex> guard(mp_mutex);
@@ -193,6 +194,7 @@ bool StatefulReader::matched_writer_add(
             return false;
         }
 
+        listener = mp_listener;
         bool is_same_process = RTPSDomainImpl::should_intraprocess_between(m_guid, wdata.guid());
         bool is_datasharing = !is_same_process && is_datasharing_compatible_with(wdata);
 
@@ -201,6 +203,13 @@ bool StatefulReader::matched_writer_add(
             if (it->guid() == wdata.guid())
             {
                 logInfo(RTPS_READER, "Attempting to add existing writer, updating information");
+                // If Ownership strength changes then update all history instances.
+                if (EXCLUSIVE_OWNERSHIP_QOS == m_att.ownershipKind &&
+                        it->ownership_strength() != wdata.m_qos.m_ownershipStrength.value)
+                {
+                    mp_history->writer_update_its_ownership_strength_nts(
+                        it->guid(), wdata.m_qos.m_ownershipStrength.value);
+                }
                 it->update(wdata);
                 if (!is_same_process)
                 {
@@ -210,12 +219,11 @@ bool StatefulReader::matched_writer_add(
                     }
                 }
 
-                if (nullptr != mp_listener)
+                if (nullptr != listener)
                 {
                     // call the listener without the lock taken
                     guard.unlock();
-                    mp_listener->on_writer_discovery(this, WriterDiscoveryInfo::CHANGED_QOS_WRITER, wdata.guid(),
-                            &wdata);
+                    listener->on_writer_discovery(this, WriterDiscoveryInfo::CHANGED_QOS_WRITER, wdata.guid(), &wdata);
                 }
                 return false;
             }
@@ -318,9 +326,9 @@ bool StatefulReader::matched_writer_add(
         }
     }
 
-    if (nullptr != mp_listener)
+    if (nullptr != listener)
     {
-        mp_listener->on_writer_discovery(this, WriterDiscoveryInfo::DISCOVERED_WRITER, wdata.guid(), &wdata);
+        listener->on_writer_discovery(this, WriterDiscoveryInfo::DISCOVERED_WRITER, wdata.guid(), &wdata);
     }
 
     return true;
@@ -385,8 +393,9 @@ bool StatefulReader::matched_writer_remove(
             if (nullptr != mp_listener)
             {
                 // call the listener without the lock taken
+                ReaderListener* listener = mp_listener;
                 lock.unlock();
-                mp_listener->on_writer_discovery(this, WriterDiscoveryInfo::REMOVED_WRITER, writer_guid, nullptr);
+                listener->on_writer_discovery(this, WriterDiscoveryInfo::REMOVED_WRITER, writer_guid, nullptr);
             }
         }
         else
@@ -540,7 +549,9 @@ bool StatefulReader::processDataMsg(
             CacheChange_t* change_to_add = nullptr;
             if (!change_pool_->reserve_cache(change_to_add))
             {
-                logError(RTPS_MSG_IN, IDSTRING "Problem reserving CacheChange in reader: " << m_guid);
+                logWarning(RTPS_MSG_IN,
+                        IDSTRING "Reached the maximum number of samples allowed by this reader's QoS. Rejecting change for reader: " <<
+                        m_guid );
                 return false;
             }
 
@@ -929,7 +940,21 @@ bool StatefulReader::change_removed_by_history(
                 {
                     --total_unread_;
                 }
+            }
 
+            WriterProxy* proxy = wp;
+
+            if (nullptr == proxy)
+            {
+                if (!findWriterProxy(a_change->writerGUID, &proxy))
+                {
+                    return false;
+                }
+            }
+
+            if (nullptr != proxy)
+            {
+                send_ack_if_datasharing(this, mp_history, proxy, a_change->sequenceNumber);
             }
         }
         else
@@ -947,6 +972,7 @@ bool StatefulReader::change_removed_by_history(
                 }
 
                 proxy->irrelevant_change_set(a_change->sequenceNumber);
+                send_ack_if_datasharing(this, mp_history, proxy, a_change->sequenceNumber);
             }
 
         }
@@ -1000,9 +1026,17 @@ bool StatefulReader::change_received(
                         // initialized using this SequenceNumber_t. Note that on a SERVER the own DATA(p) may be in any
                         // position within the WriterHistory preventing effective data exchange.
                         update_last_notified(a_change->writerGUID, SequenceNumber_t(0, 1));
-                        if (getListener() != nullptr)
+                        auto listener = getListener();
+                        if (listener != nullptr)
                         {
-                            getListener()->onNewCacheChangeAdded((RTPSReader*)this, a_change);
+                            bool notify_single = false;
+                            auto guid = a_change->writerGUID;
+                            auto seq = a_change->sequenceNumber;
+                            listener->on_data_available(this, guid, seq, seq, notify_single);
+                            if (notify_single)
+                            {
+                                listener->onNewCacheChangeAdded(this, a_change);
+                            }
                         }
 
                         return true;
@@ -1019,6 +1053,16 @@ bool StatefulReader::change_received(
         {
             unknown_missing_changes_up_to = prox->unknown_missing_changes_up_to(a_change->sequenceNumber);
         }
+    }
+
+    // Update Ownership strength.
+    if (EXCLUSIVE_OWNERSHIP_QOS == m_att.ownershipKind)
+    {
+        a_change->reader_info.writer_ownership_strength = prox->ownership_strength();
+    }
+    else
+    {
+        a_change->reader_info.writer_ownership_strength = std::numeric_limits<uint32_t>::max();
     }
 
     // NOTE: Depending on QoS settings, one change can be removed from history
@@ -1042,7 +1086,9 @@ bool StatefulReader::change_received(
             if (mp_history->changesEnd() == mp_history->find_change(a_change))
             {
                 prox->irrelevant_change_set(a_change->sequenceNumber);
+                send_ack_if_datasharing(this, mp_history, prox, a_change->sequenceNumber);
                 ret = false;
+
             }
         }
 
@@ -1081,38 +1127,67 @@ bool StatefulReader::change_received(
 void StatefulReader::NotifyChanges(
         WriterProxy* prox)
 {
+    CacheChange_t* aux_ch = nullptr;
     GUID_t proxGUID = prox->guid();
-    update_last_notified(proxGUID, prox->available_changes_max());
-    SequenceNumber_t nextChangeToNotify = prox->next_cache_change_to_be_notified();
+    SequenceNumber_t max_seq = prox->available_changes_max();
+    SequenceNumber_t first_seq = prox->next_cache_change_to_be_notified();
 
-    while (nextChangeToNotify != SequenceNumber_t::unknown())
+    bool new_data_available = false;
+
+    // Update state before notifying
+    update_last_notified(proxGUID, max_seq);
+    History::const_iterator it = mp_history->changesBegin();
+    SequenceNumber_t next_seq = first_seq;
+    while (next_seq != c_SequenceNumber_Unknown &&
+            mp_history->changesEnd() != (it = mp_history->get_change_nts(next_seq, proxGUID, &aux_ch, it)) &&
+            (*it)->sequenceNumber <= max_seq)
     {
-        CacheChange_t* ch_to_give = nullptr;
+        aux_ch = *it;
+        assert(false == aux_ch->isRead);
+        new_data_available = true;
+        ++total_unread_;
+        on_data_notify(proxGUID, aux_ch->sourceTimestamp);
 
-        if (mp_history->get_change(nextChangeToNotify, proxGUID, &ch_to_give))
+        ++it;
+        do
         {
-            if (!ch_to_give->isRead)
+            next_seq = prox->next_cache_change_to_be_notified();
+        } while (next_seq != c_SequenceNumber_Unknown && next_seq <= aux_ch->sequenceNumber);
+    }
+    // Ensure correct state of proxy when max_seq is not present in history
+    while (c_SequenceNumber_Unknown != prox->next_cache_change_to_be_notified())
+    {
+    }
+
+    // Notify listener if new data is available
+    auto listener = getListener();
+    if (new_data_available && (nullptr != listener))
+    {
+        bool notify_individual = false;
+        listener->on_data_available(this, proxGUID, first_seq, max_seq, notify_individual);
+
+        if (notify_individual)
+        {
+            it = mp_history->changesBegin();
+            next_seq = first_seq;
+            while (next_seq <= max_seq &&
+                    mp_history->changesEnd() != (it = mp_history->get_change_nts(next_seq, proxGUID, &aux_ch, it)) &&
+                    (*it)->sequenceNumber <= max_seq)
             {
-                ++total_unread_;
+                aux_ch = *it;
+                next_seq = aux_ch->sequenceNumber + 1;
+                listener->onNewCacheChangeAdded(this, aux_ch);
 
-                on_data_notify(ch_to_give->writerGUID, ch_to_give->sourceTimestamp);
-
-                if (getListener() != nullptr)
-                {
-                    getListener()->onNewCacheChangeAdded((RTPSReader*)this, ch_to_give);
-                }
-
-                new_notification_cv_.notify_all();
+                // Reset the iterator to the beginning, since it may be invalidated inside the callback
+                it = mp_history->changesBegin();
             }
         }
+    }
 
-        // Search again the WriterProxy because could be removed after the unlock.
-        if (!findWriterProxy(proxGUID, &prox))
-        {
-            break;
-        }
-
-        nextChangeToNotify = prox->next_cache_change_to_be_notified();
+    // Notify in case someone is waiting for unread messages
+    if (new_data_available)
+    {
+        new_notification_cv_.notify_all();
     }
 }
 

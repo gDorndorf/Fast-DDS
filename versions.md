@@ -1,9 +1,33 @@
+Forthcoming
+-----------
+
+* Added API get the WAN address of TCPv4 transport descriptors (API extension)
+* Support `propagate` attribute for Properties in PropertyQoSPolicies so they could be
+  set by user and sent in PDP
+* Added possibility to configure Ownership and Ownership Strength QoS Policies from XML profiles file
+* Added Server Name Indication (SNI) support for TLS-TCP communication
+* Changes to allow running tests on Android emulator or device
+* Added configuration settings for announcing locators on external LANs (ABI break)
+
+Version 2.7.1
+-------------
+
+* ReadCondition implementation according to DDS version 1.4 standard document
+* Added a new CMake option to allow users to force the use of our third party shared_mutex
+
 Version 2.7.0
 -------------
 
 * Implementation of DataWriter methods write_w_timestamp, register_instance_w_timestamp,
   unregister_instance_w_timestamp, and dispose_w_timestamp (ABI break)
 * Support of `SampleRejectedStatus` in DDS API (API extensions on RTPS layer)
+* Implementation of DomainParticipant method find_topic
+* Include Server Name Indication (SNI) empty API (ABI break on transport layer)
+* CacheChange_t destructor made virtual (ABI break on RTPS layer)
+* Added DDS APIs for ReadCondition (API extension)
+* Added bulk notification interface to RTPS reader listener (API extension)
+* Refactor of auxiliary utils class DBQueue (ABI break)
+* Added configuration data for external locators feature (ABI break)
 
 Version 2.6.1
 -------------

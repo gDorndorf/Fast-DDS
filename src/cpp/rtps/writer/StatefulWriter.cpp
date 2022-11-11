@@ -48,6 +48,7 @@
 #include <rtps/RTPSDomainImpl.hpp>
 #include <rtps/history/CacheChangePool.h>
 #include <rtps/messages/RTPSGapBuilder.hpp>
+#include <rtps/network/ExternalLocatorsProcessor.hpp>
 
 #include "../builtin/discovery/database/DiscoveryDataBase.hpp"
 
@@ -566,11 +567,7 @@ bool StatefulWriter::change_removed_by_history(
 
 void StatefulWriter::send_heartbeat_to_all_readers()
 {
-    // This version is called from send_any_unsent_changes when any of the following conditions is satisfied:
-    // a) history is empty
-    // b) there are no matched readers
-
-    // It may also be called from send_periodic_heartbeat
+    // This method is only called from send_periodic_heartbeat
 
     if (m_separateSendingEnabled)
     {
@@ -594,37 +591,14 @@ void StatefulWriter::send_heartbeat_to_all_readers()
         if (there_are_remote_readers_)
         {
             RTPSMessageGroup group(mp_RTPSParticipant, this, &locator_selector_general_);
+            select_all_readers_nts(group, locator_selector_general_);
 
-            // Send a GAP with holes in the history.
-            SequenceNumber_t first_seq = get_seq_num_min();
-            SequenceNumber_t last_seq = get_seq_num_max();
+            assert(
+                (SequenceNumber_t::unknown() == get_seq_num_min() && SequenceNumber_t::unknown() == get_seq_num_max()) ||
+                (SequenceNumber_t::unknown() != get_seq_num_min() &&
+                SequenceNumber_t::unknown() != get_seq_num_max()));
 
-            assert((SequenceNumber_t::unknown() == first_seq && SequenceNumber_t::unknown() == last_seq) ||
-                    (SequenceNumber_t::unknown() != first_seq && SequenceNumber_t::unknown() != last_seq));
-
-            if (SequenceNumber_t::unknown() != first_seq &&
-                    last_seq.to64long() - first_seq.to64long() + 1 != mp_history->getHistorySize())
-            {
-                RTPSGapBuilder gaps(group);
-
-                // There are holes in the history.
-                History::const_iterator cit = mp_history->changesBegin();
-                SequenceNumber_t prev = (*cit)->sequenceNumber + 1;
-                ++cit;
-                while (cit != mp_history->changesEnd())
-                {
-                    while (prev != (*cit)->sequenceNumber)
-                    {
-                        gaps.add(prev);
-                        ++prev;
-                    }
-
-                    ++prev;
-                    ++cit;
-                }
-
-                gaps.flush();
-            }
+            add_gaps_for_holes_in_history_(group);
 
             send_heartbeat_nts_(locator_selector_general_.all_remote_readers.size(), group, disable_positive_acks_);
         }
@@ -774,7 +748,17 @@ DeliveryRetCode StatefulWriter::deliver_sample_to_network(
             }
         }
 
-        if (SequenceNumber_t::unknown() != gap_seq_for_all) // Send GAP for all readers
+        bool should_send_global_gap = SequenceNumber_t::unknown() != gap_seq_for_all;
+
+        if (locator_selector.locator_selector.state_has_changed() &&
+                ((should_be_sent && !m_separateSendingEnabled) || should_send_global_gap))
+        {
+            group.flush_and_reset();
+            network.select_locators(locator_selector.locator_selector);
+            compute_selected_guids(locator_selector);
+        }
+
+        if (should_send_global_gap) // Send GAP for all readers
         {
             group.add_gap(gap_seq_for_all, SequenceNumberSet_t(change->sequenceNumber));
         }
@@ -789,9 +773,6 @@ DeliveryRetCode StatefulWriter::deliver_sample_to_network(
                     size_t num_locators = locator_selector.locator_selector.selected_size();
                     if (num_locators > 0)
                     {
-                        network.select_locators(locator_selector.locator_selector);
-                        compute_selected_guids(locator_selector);
-
                         if (0 < n_fragments)
                         {
                             if (min_unsent_fragment != n_fragments + 1)
@@ -865,7 +846,7 @@ DeliveryRetCode StatefulWriter::deliver_sample_to_network(
                             }
                         }
 
-                        send_heartbeat_piggyback_nts_(nullptr, group, locator_selector, last_processed);
+                        send_heartbeat_piggyback_nts_(group, locator_selector, last_processed);
                     }
                 }
                 else
@@ -965,10 +946,6 @@ DeliveryRetCode StatefulWriter::deliver_sample_to_network(
 
     }
 
-    locator_selector.locator_selector.reset(true);
-    network.select_locators(locator_selector.locator_selector);
-    compute_selected_guids(locator_selector);
-
     if (need_reactivate_periodic_heartbeat)
     {
         periodic_hb_event_->restart_timer(max_blocking_time);
@@ -1002,9 +979,24 @@ void StatefulWriter::update_reader_info(
     there_are_datasharing_readers_ = !matched_datasharing_readers_.empty();
 }
 
+void StatefulWriter::select_all_readers_nts(
+        RTPSMessageGroup& group,
+        LocatorSelectorSender& locator_selector)
+{
+    locator_selector.locator_selector.reset(true);
+    if (locator_selector.locator_selector.state_has_changed())
+    {
+        group.flush_and_reset();
+        mp_RTPSParticipant->network_factory().select_locators(locator_selector.locator_selector);
+        compute_selected_guids(locator_selector);
+    }
+}
+
 bool StatefulWriter::matched_reader_add(
         const ReaderProxyData& rdata)
 {
+    using fastdds::rtps::ExternalLocatorsProcessor::filter_remote_locators;
+
     if (rdata.guid() == c_Guid_Unknown)
     {
         logError(RTPS_WRITER, "Reliable Writer need GUID_t of matched readers");
@@ -1024,6 +1016,10 @@ bool StatefulWriter::matched_reader_add(
                     logInfo(RTPS_WRITER, "Attempting to add existing reader, updating information.");
                     if (reader->update(rdata))
                     {
+                        filter_remote_locators(*reader->general_locator_selector_entry(),
+                        m_att.external_unicast_locators, m_att.ignore_non_matching_locators);
+                        filter_remote_locators(*reader->async_locator_selector_entry(),
+                        m_att.external_unicast_locators, m_att.ignore_non_matching_locators);
                         update_reader_info(locator_selector_general_, true);
                         update_reader_info(locator_selector_async_, true);
                     }
@@ -1069,8 +1065,12 @@ bool StatefulWriter::matched_reader_add(
 
     // Add info of new datareader.
     rp->start(rdata, is_datasharing_compatible_with(rdata));
-    locator_selector_general_.locator_selector.add_entry(rp->locator_selector_entry());
-    locator_selector_async_.locator_selector.add_entry(rp->locator_selector_entry());
+    filter_remote_locators(*rp->general_locator_selector_entry(),
+            m_att.external_unicast_locators, m_att.ignore_non_matching_locators);
+    filter_remote_locators(*rp->async_locator_selector_entry(),
+            m_att.external_unicast_locators, m_att.ignore_non_matching_locators);
+    locator_selector_general_.locator_selector.add_entry(rp->general_locator_selector_entry());
+    locator_selector_async_.locator_selector.add_entry(rp->async_locator_selector_entry());
 
     if (rp->is_local_reader())
     {
@@ -1341,7 +1341,7 @@ bool StatefulWriter::is_acked_by_all(
 {
     assert(mp_history->next_sequence_number() > seq);
     return (seq < next_all_acked_notify_sequence_) ||
-           !for_matched_readers(matched_local_readers_, matched_remote_readers_,
+           !for_matched_readers(matched_local_readers_, matched_datasharing_readers_, matched_remote_readers_,
                    [seq](const ReaderProxy* reader)
                    {
                        return !(reader->change_is_acked(seq));
@@ -1655,6 +1655,7 @@ bool StatefulWriter::send_periodic_heartbeat(
     }
     else if (m_separateSendingEnabled)
     {
+        // Send individual liveliness heartbeat to each reader
         for_matched_readers(matched_local_readers_, matched_datasharing_readers_, matched_remote_readers_,
                 [this, &liveliness, &unacked_changes](ReaderProxy* reader)
                 {
@@ -1726,6 +1727,18 @@ void StatefulWriter::send_heartbeat_to_nts(
             try
             {
                 RTPSMessageGroup group(mp_RTPSParticipant, this, remoteReaderProxy.message_sender());
+                SequenceNumber_t firstSeq = get_seq_num_min();
+                SequenceNumber_t lastSeq = get_seq_num_max();
+
+                if (firstSeq != c_SequenceNumber_Unknown && lastSeq != c_SequenceNumber_Unknown)
+                {
+                    assert(firstSeq <= lastSeq);
+                    if (!liveliness)
+                    {
+                        add_gaps_for_holes_in_history_(group);
+                    }
+                }
+
                 send_heartbeat_nts_(1u, group, disable_positive_acks_, liveliness);
             }
             catch (const RTPSMessageGroup::timeout&)
@@ -1767,8 +1780,6 @@ void StatefulWriter::send_heartbeat_nts_(
     else
     {
         assert(firstSeq <= lastSeq);
-
-        // Check if it has to be sent a GAP with the gaps in the history
     }
 
     incrementHBCount();
@@ -1780,26 +1791,16 @@ void StatefulWriter::send_heartbeat_nts_(
 }
 
 void StatefulWriter::send_heartbeat_piggyback_nts_(
-        ReaderProxy* reader,
         RTPSMessageGroup& message_group,
         LocatorSelectorSender& locator_selector,
         uint32_t& last_bytes_processed)
 {
     if (!disable_heartbeat_piggyback_)
     {
-        size_t number_of_readers = reader == nullptr ? locator_selector.all_remote_readers.size() : 1u;
         if (mp_history->isFull() || next_all_acked_notify_sequence_ < get_seq_num_min())
         {
-            if (reader == nullptr)
-            {
-                locator_selector.locator_selector.reset(true);
-                if (locator_selector.locator_selector.state_has_changed())
-                {
-                    message_group.flush_and_reset();
-                    getRTPSParticipant()->network_factory().select_locators(locator_selector.locator_selector);
-                    compute_selected_guids(locator_selector);
-                }
-            }
+            select_all_readers_nts(message_group, locator_selector);
+            size_t number_of_readers = locator_selector.all_remote_readers.size();
             send_heartbeat_nts_(number_of_readers, message_group, disable_positive_acks_);
         }
         else
@@ -1809,6 +1810,8 @@ void StatefulWriter::send_heartbeat_piggyback_nts_(
             last_bytes_processed = current_bytes;
             if (currentUsageSendBufferSize_ < 0)
             {
+                select_all_readers_nts(message_group, locator_selector);
+                size_t number_of_readers = locator_selector.all_remote_readers.size();
                 send_heartbeat_nts_(number_of_readers, message_group, disable_positive_acks_);
             }
         }
@@ -1911,6 +1914,7 @@ bool StatefulWriter::process_acknack(
                                         {
                                             // Send heartbeat if requested
                                             send_heartbeat_to_nts(*remote_reader, false, true);
+                                            periodic_hb_event_->restart_timer();
                                         }
                                     }
 
@@ -2079,6 +2083,34 @@ DeliveryRetCode StatefulWriter::deliver_sample_nts(
     check_acked_status();
 
     return ret_code;
+}
+
+void StatefulWriter::add_gaps_for_holes_in_history_(
+        RTPSMessageGroup& group)
+{
+    SequenceNumber_t firstSeq = get_seq_num_min();
+    SequenceNumber_t lastSeq = get_seq_num_max();
+
+    if (SequenceNumber_t::unknown() != firstSeq &&
+            lastSeq.to64long() - firstSeq.to64long() + 1 != mp_history->getHistorySize())
+    {
+        RTPSGapBuilder gaps(group);
+        // There are holes in the history.
+        History::const_iterator cit = mp_history->changesBegin();
+        SequenceNumber_t prev = (*cit)->sequenceNumber + 1;
+        ++cit;
+        while (cit != mp_history->changesEnd())
+        {
+            while (prev != (*cit)->sequenceNumber)
+            {
+                gaps.add(prev);
+                ++prev;
+            }
+            ++prev;
+            ++cit;
+        }
+        gaps.flush();
+    }
 }
 
 }  // namespace rtps

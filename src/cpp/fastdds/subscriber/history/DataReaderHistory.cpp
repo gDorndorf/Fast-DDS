@@ -17,6 +17,7 @@
  */
 
 #include <limits>
+#include <memory>
 #include <mutex>
 
 #include "DataReaderHistory.hpp"
@@ -28,15 +29,17 @@
 #include <fastdds/rtps/reader/RTPSReader.h>
 
 #include <fastdds/subscriber/DataReaderImpl/ReadTakeCommand.hpp>
+
+#include <rtps/common/ChangeComparison.hpp>
 #include <rtps/reader/WriterProxy.h>
 #include <utils/collections/sorted_vector_insert.hpp>
+
+using namespace eprosima::fastrtps::rtps;
 
 namespace eprosima {
 namespace fastdds {
 namespace dds {
 namespace detail {
-
-using namespace eprosima::fastrtps::rtps;
 
 using eprosima::fastrtps::RecursiveTimedMutex;
 
@@ -98,8 +101,9 @@ DataReaderHistory::DataReaderHistory(
         key_changes_allocation_.initial = resource_limited_qos_.allocated_samples;
         key_changes_allocation_.maximum = resource_limited_qos_.max_samples;
 
-        keyed_changes_.emplace(c_InstanceHandle_Unknown,
-                DataReaderInstance{ key_changes_allocation_, key_writers_allocation_ });
+        instances_.emplace(c_InstanceHandle_Unknown,
+                std::make_shared<DataReaderInstance>(key_changes_allocation_, key_writers_allocation_));
+        data_available_instances_[c_InstanceHandle_Unknown] = instances_[c_InstanceHandle_Unknown];
     }
 
     using std::placeholders::_1;
@@ -199,7 +203,7 @@ bool DataReaderHistory::received_change(
     if ((0 == unknown_missing_changes_up_to) ||
             (m_changes.size() + unknown_missing_changes_up_to < static_cast<size_t>(resource_limited_qos_.max_samples)))
     {
-        std::lock_guard<RecursiveTimedMutex> guard(*mp_mutex);
+        std::lock_guard<RecursiveTimedMutex> guard(*getMutex());
         ret_value =  receive_fn_(a_change, unknown_missing_changes_up_to, rejection_reason);
     }
     else
@@ -225,11 +229,11 @@ bool DataReaderHistory::received_change_keep_all(
     InstanceCollection::iterator vit;
     if (find_key(a_change->instanceHandle, vit))
     {
-        DataReaderInstance::ChangeCollection& instance_changes = vit->second.cache_changes;
+        DataReaderInstance::ChangeCollection& instance_changes = vit->second->cache_changes;
         size_t total_size = instance_changes.size() + unknown_missing_changes_up_to;
         if (total_size < static_cast<size_t>(resource_limited_qos_.max_samples_per_instance))
         {
-            ret_value =  add_received_change_with_key(a_change, vit->second, rejection_reason);
+            ret_value =  add_received_change_with_key(a_change, *vit->second, rejection_reason);
         }
         else
         {
@@ -261,7 +265,7 @@ bool DataReaderHistory::received_change_keep_last(
     InstanceCollection::iterator vit;
     if (find_key(a_change->instanceHandle, vit))
     {
-        DataReaderInstance::ChangeCollection& instance_changes = vit->second.cache_changes;
+        DataReaderInstance::ChangeCollection& instance_changes = vit->second->cache_changes;
         if (instance_changes.size() < static_cast<size_t>(history_qos_.depth))
         {
             ret_value = true;
@@ -284,7 +288,7 @@ bool DataReaderHistory::received_change_keep_last(
 
         if (ret_value)
         {
-            ret_value = add_received_change_with_key(a_change, vit->second, rejection_reason);
+            ret_value = add_received_change_with_key(a_change, *vit->second, rejection_reason);
         }
     }
     else
@@ -336,11 +340,8 @@ void DataReaderHistory::add_to_instance(
 {
     // ADD TO KEY VECTOR
     DataReaderCacheChange item = a_change;
-    eprosima::utilities::collections::sorted_vector_insert(instance.cache_changes, item,
-            [](const DataReaderCacheChange& lhs, const DataReaderCacheChange& rhs)
-            {
-                return lhs->sourceTimestamp < rhs->sourceTimestamp;
-            });
+    eprosima::utilities::collections::sorted_vector_insert(instance.cache_changes, item, rtps::history_order_cmp);
+    data_available_instances_[a_change->instanceHandle] = instances_[a_change->instanceHandle];
 
     logInfo(SUBSCRIBER, mp_reader->getGuid().entityId
             << ": Change " << a_change->sequenceNumber << " added from: "
@@ -350,22 +351,22 @@ void DataReaderHistory::add_to_instance(
 bool DataReaderHistory::get_first_untaken_info(
         SampleInfo& info)
 {
-    std::lock_guard<RecursiveTimedMutex> lock(*mp_mutex);
+    std::lock_guard<RecursiveTimedMutex> lock(*getMutex());
 
     CacheChange_t* change = nullptr;
     WriterProxy* wp = nullptr;
     if (mp_reader->nextUntakenCache(&change, &wp))
     {
-        auto it = keyed_changes_.find(change->instanceHandle);
-        assert(it != keyed_changes_.end());
-        auto& instance_changes = it->second.cache_changes;
+        auto it = data_available_instances_.find(change->instanceHandle);
+        assert(it != data_available_instances_.end());
+        auto& instance_changes = it->second->cache_changes;
         auto item =
                 std::find_if(instance_changes.cbegin(), instance_changes.cend(),
                         [change](const DataReaderCacheChange& v)
                         {
                             return v == change;
                         });
-        ReadTakeCommand::generate_info(info, it->second, *item);
+        ReadTakeCommand::generate_info(info, *(it->second), *item);
         mp_reader->change_read_by_user(change, wp, false);
         return true;
     }
@@ -378,27 +379,29 @@ bool DataReaderHistory::find_key(
         InstanceCollection::iterator& vit_out)
 {
     InstanceCollection::iterator vit;
-    vit = keyed_changes_.find(handle);
-    if (vit != keyed_changes_.end())
+    vit = instances_.find(handle);
+    if (vit != instances_.end())
     {
         vit_out = vit;
         return true;
     }
 
-    if (keyed_changes_.size() < static_cast<size_t>(resource_limited_qos_.max_instances))
+    if (instances_.size() < static_cast<size_t>(resource_limited_qos_.max_instances))
     {
-        vit_out = keyed_changes_.emplace(handle,
-                        DataReaderInstance{key_changes_allocation_, key_writers_allocation_}).first;
+        vit_out = instances_.emplace(handle,
+                        std::make_shared<DataReaderInstance>(key_changes_allocation_, key_writers_allocation_)).first;
         return true;
     }
 
-    for (vit = keyed_changes_.begin(); vit != keyed_changes_.end(); ++vit)
+    for (vit = instances_.begin(); vit != instances_.end(); ++vit)
     {
-        if (InstanceStateKind::ALIVE_INSTANCE_STATE != vit->second.instance_state)
+        if (InstanceStateKind::ALIVE_INSTANCE_STATE != vit->second->instance_state)
         {
-            keyed_changes_.erase(vit);
-            vit_out = keyed_changes_.emplace(handle,
-                            DataReaderInstance{ key_changes_allocation_, key_writers_allocation_ }).first;
+            data_available_instances_.erase(vit->first);
+            instances_.erase(vit);
+            vit_out = instances_.emplace(handle,
+                            std::make_shared<DataReaderInstance>(key_changes_allocation_,
+                            key_writers_allocation_)).first;
             return true;
         }
     }
@@ -411,6 +414,7 @@ void DataReaderHistory::writer_unmatched(
         const GUID_t& writer_guid,
         const SequenceNumber_t& last_notified_seq)
 {
+    // Remove all future changes from the unmatched writer
     remove_changes_with_pred(
         [&writer_guid, &last_notified_seq](CacheChange_t* ch)
         {
@@ -427,18 +431,23 @@ bool DataReaderHistory::remove_change_sub(
         return false;
     }
 
-    std::lock_guard<RecursiveTimedMutex> guard(*mp_mutex);
+    std::lock_guard<RecursiveTimedMutex> guard(*getMutex());
     bool found = false;
     InstanceCollection::iterator vit;
     if (find_key(change->instanceHandle, vit))
     {
-        for (auto chit = vit->second.cache_changes.begin(); chit != vit->second.cache_changes.end(); ++chit)
+        for (auto chit = vit->second->cache_changes.begin(); chit != vit->second->cache_changes.end(); ++chit)
         {
             if ((*chit)->sequenceNumber == change->sequenceNumber &&
                     (*chit)->writerGUID == change->writerGUID)
             {
-                vit->second.cache_changes.erase(chit);
+                vit->second->cache_changes.erase(chit);
                 found = true;
+
+                if (change->isRead)
+                {
+                    --counters_.samples_read;
+                }
                 break;
             }
         }
@@ -451,6 +460,7 @@ bool DataReaderHistory::remove_change_sub(
     if (remove_change(change))
     {
         m_isHistoryFull = false;
+        counters_.samples_unread = mp_reader->get_unread_count();
         return true;
     }
 
@@ -467,19 +477,24 @@ bool DataReaderHistory::remove_change_sub(
         return false;
     }
 
-    std::lock_guard<RecursiveTimedMutex> guard(*mp_mutex);
+    std::lock_guard<RecursiveTimedMutex> guard(*getMutex());
     bool found = false;
     InstanceCollection::iterator vit;
     if (find_key(change->instanceHandle, vit))
     {
-        for (auto chit = vit->second.cache_changes.begin(); chit != vit->second.cache_changes.end(); ++chit)
+        for (auto chit = vit->second->cache_changes.begin(); chit != vit->second->cache_changes.end(); ++chit)
         {
             if ((*chit)->sequenceNumber == change->sequenceNumber &&
                     (*chit)->writerGUID == change->writerGUID)
             {
                 assert(it == chit);
-                it = vit->second.cache_changes.erase(chit);
+                it = vit->second->cache_changes.erase(chit);
                 found = true;
+
+                if (change->isRead)
+                {
+                    --counters_.samples_read;
+                }
                 break;
             }
         }
@@ -499,26 +514,32 @@ bool DataReaderHistory::remove_change_sub(
     m_isHistoryFull = false;
     ReaderHistory::remove_change_nts(chit);
 
+    counters_.samples_unread = mp_reader->get_unread_count();
     return true;
 }
 
 bool DataReaderHistory::set_next_deadline(
         const InstanceHandle_t& handle,
-        const std::chrono::steady_clock::time_point& next_deadline_us)
+        const std::chrono::steady_clock::time_point& next_deadline_us,
+        bool deadline_missed)
 {
     if (mp_reader == nullptr || mp_mutex == nullptr)
     {
         logError(SUBSCRIBER, "You need to create a Reader with this History before using it");
         return false;
     }
-    std::lock_guard<RecursiveTimedMutex> guard(*mp_mutex);
-    auto it = keyed_changes_.find(handle);
-    if (it == keyed_changes_.end())
+    std::lock_guard<RecursiveTimedMutex> guard(*getMutex());
+    auto it = instances_.find(handle);
+    if (it == instances_.end())
     {
         return false;
     }
 
-    it->second.next_deadline_us = next_deadline_us;
+    if (deadline_missed)
+    {
+        it->second->deadline_missed();
+    }
+    it->second->next_deadline_us = next_deadline_us;
     return true;
 }
 
@@ -531,80 +552,120 @@ bool DataReaderHistory::get_next_deadline(
         logError(SUBSCRIBER, "You need to create a Reader with this History before using it");
         return false;
     }
-    std::lock_guard<RecursiveTimedMutex> guard(*mp_mutex);
-    auto min = std::min_element(keyed_changes_.begin(),
-                    keyed_changes_.end(),
+    std::lock_guard<RecursiveTimedMutex> guard(*getMutex());
+    auto min = std::min_element(instances_.begin(),
+                    instances_.end(),
                     [](
-                        const std::pair<InstanceHandle_t, DataReaderInstance>& lhs,
-                        const std::pair<InstanceHandle_t, DataReaderInstance>& rhs)
+                        const InstanceCollection::value_type& lhs,
+                        const InstanceCollection::value_type& rhs)
                     {
-                        return lhs.second.next_deadline_us < rhs.second.next_deadline_us;
+                        return lhs.second->next_deadline_us < rhs.second->next_deadline_us;
                     });
     handle = min->first;
-    next_deadline_us = min->second.next_deadline_us;
+    next_deadline_us = min->second->next_deadline_us;
     return true;
 }
 
-std::pair<bool, DataReaderHistory::instance_info> DataReaderHistory::lookup_instance(
-        const InstanceHandle_t& handle,
-        bool exact) const
+uint64_t DataReaderHistory::get_unread_count(
+        bool mark_as_read)
 {
+    std::lock_guard<RecursiveTimedMutex> guard(*getMutex());
+    uint64_t ret_val = mp_reader->get_unread_count(mark_as_read);
+    assert(ret_val == counters_.samples_unread);
+    if (mark_as_read)
+    {
+        counters_.samples_read += ret_val;
+        counters_.samples_unread = 0;
+    }
+    return ret_val;
+}
+
+bool DataReaderHistory::is_instance_present(
+        const InstanceHandle_t& handle) const
+{
+    return has_keys_ && instances_.find(handle) != instances_.end();
+}
+
+std::pair<bool, DataReaderHistory::instance_info> DataReaderHistory::lookup_available_instance(
+        const InstanceHandle_t& handle,
+        bool exact)
+{
+    InstanceCollection::iterator it = data_available_instances_.end();
+
     if (!has_keys_)
     {
-        if (handle.isDefined())
+        // NO_KEY topics can only return the fictitious instance.
+        // Execution can only get here for two reasons:
+        // - Looking for a specific instance (exact = true)
+        // - Looking for the next instance to the ficticious one (exact = false)
+        // In both cases, no instance should be returned
+        if (!handle.isDefined() && !exact)
         {
-            // NO_KEY topics can only return the ficticious instance.
-            // Execution can only get here for two reasons:
-            // - Looking for a specific instance (exact = true)
-            // - Looking for the next instance to the ficticious one (exact = false)
-            // In both cases, no instance should be returned
-            return { false, {InstanceHandle_t(), nullptr} };
+            // Looking for the first instance, return the ficticious one containing all changes
+            it = data_available_instances_.begin();
         }
-
-        if (exact)
-        {
-            // Looking for HANDLE_NIL, nothing to return
-            return { false, {InstanceHandle_t(), nullptr} };
-        }
-
-        // Looking for the first instance, return the ficticious one containing all changes
-        InstanceHandle_t tmp;
-        tmp.value[0] = 1;
-        return { true, {tmp, const_cast<DataReaderInstance*>(&keyed_changes_.begin()->second)} };
-    }
-
-    InstanceCollection::const_iterator it;
-
-    if (exact)
-    {
-        it = keyed_changes_.find(handle);
     }
     else
     {
-        auto comp = [](const InstanceHandle_t& h, const std::pair<InstanceHandle_t, DataReaderInstance>& it)
-                {
-                    return h < it.first;
-                };
-        it = std::upper_bound(keyed_changes_.begin(), keyed_changes_.end(), handle, comp);
+        if (exact)
+        {
+            // Looking for a specific instance on a topic with key
+            it = data_available_instances_.find(handle);
+        }
+        else
+        {
+            if (!handle.isDefined())
+            {
+                // Looking for the first instance on a topic with key
+                it = data_available_instances_.begin();
+            }
+            else
+            {
+                // Looking for an instance with a handle greater than the one on the input
+                auto comp = [](const InstanceHandle_t& h, const InstanceCollection::value_type& it)
+                        {
+                            return h < it.first;
+                        };
+                it = std::upper_bound(data_available_instances_.begin(), data_available_instances_.end(), handle, comp);
+            }
+        }
     }
 
-    if (it != keyed_changes_.end())
+    return { it != data_available_instances_.end(), it };
+}
+
+std::pair<bool, DataReaderHistory::instance_info> DataReaderHistory::next_available_instance_nts(
+        const InstanceHandle_t& handle,
+        const DataReaderHistory::instance_info& current_info)
+{
+    if (current_info == data_available_instances_.end())
     {
-        return { true, {it->first, const_cast<DataReaderInstance*>(&(it->second))} };
+        return { false, current_info };
     }
-    return { false, {InstanceHandle_t(), nullptr} };
+    instance_info it = current_info;
+    if (it->first == handle)
+    {
+        ++it;
+    }
+
+    return { it != data_available_instances_.end(), it };
 }
 
 void DataReaderHistory::check_and_remove_instance(
         DataReaderHistory::instance_info& instance_info)
 {
-    DataReaderInstance* instance = instance_info.second;
-    if (instance->cache_changes.empty() &&
-            (InstanceStateKind::ALIVE_INSTANCE_STATE != instance->instance_state) &&
-            instance_info.first.isDefined())
+    DataReaderInstance* instance = instance_info->second.get();
+
+    if (instance->cache_changes.empty())
     {
-        keyed_changes_.erase(instance_info.first);
-        instance_info.second = nullptr;
+        if (InstanceStateKind::ALIVE_INSTANCE_STATE != instance->instance_state &&
+                instance->alive_writers.empty() &&
+                instance_info->first.isDefined())
+        {
+            instances_.erase(instance_info->first);
+        }
+
+        instance_info = data_available_instances_.erase(instance_info);
     }
 }
 
@@ -619,23 +680,28 @@ ReaderHistory::iterator DataReaderHistory::remove_change_nts(
         if (!has_keys_ || p_sample->is_fully_assembled())
         {
             // clean any references to this CacheChange in the key state collection
-            auto it = keyed_changes_.find(p_sample->instanceHandle);
+            auto it = instances_.find(p_sample->instanceHandle);
 
             // if keyed and in history must be in the map
             // There is a case when the sample could not be in the keyed map. The first received fragment of a
             // fragmented sample is stored in the history, and when it is completed it is stored in the keyed map.
             // But it can occur it is rejected when the sample is completed and removed without being stored in the
             // keyed map.
-            if (it != keyed_changes_.end())
+            if (it != instances_.end())
             {
-                auto& c = it->second.cache_changes;
-                c.erase(std::remove(c.begin(), c.end(), p_sample), c.end());
+                it->second->cache_changes.remove(p_sample);
+                if (p_sample->isRead)
+                {
+                    --counters_.samples_read;
+                }
             }
         }
     }
 
     // call the base class
-    return ReaderHistory::remove_change_nts(removal, release);
+    auto ret_val = ReaderHistory::remove_change_nts(removal, release);
+    counters_.samples_unread = mp_reader->get_unread_count();
+    return ret_val;
 }
 
 bool DataReaderHistory::completed_change(
@@ -662,7 +728,7 @@ bool DataReaderHistory::completed_change(
             if (find_key(change->instanceHandle, vit))
             {
                 ret_value = !change->instanceHandle.isDefined() ||
-                        complete_fn_(change, vit->second, unknown_missing_changes_up_to, rejection_reason);
+                        complete_fn_(change, *vit->second, unknown_missing_changes_up_to, rejection_reason);
             }
             else
             {
@@ -733,24 +799,80 @@ bool DataReaderHistory::completed_change_keep_last(
     return ret_value;
 }
 
-void DataReaderHistory::update_instance_nts(
+void DataReaderHistory::change_was_processed_nts(
+        CacheChange_t* const change,
+        bool is_going_to_be_mark_as_read)
+{
+    if (!change->isRead && is_going_to_be_mark_as_read)
+    {
+        ++counters_.samples_read;
+        --counters_.samples_unread;
+    }
+}
+
+void DataReaderHistory::instance_viewed_nts(
+        const InstanceCollection::mapped_type& instance)
+{
+    if (ViewStateKind::NEW_VIEW_STATE == instance->view_state)
+    {
+        instance->view_state = ViewStateKind::NOT_NEW_VIEW_STATE;
+        --counters_.instances_new;
+        ++counters_.instances_not_new;
+    }
+}
+
+bool DataReaderHistory::update_instance_nts(
         CacheChange_t* const change)
 {
     InstanceCollection::iterator vit;
-    vit = keyed_changes_.find(change->instanceHandle);
+    vit = instances_.find(change->instanceHandle);
 
-    assert(vit != keyed_changes_.end());
-    vit->second.update_state(change->kind, change->writerGUID);
-    change->reader_info.disposed_generation_count = vit->second.disposed_generation_count;
-    change->reader_info.no_writers_generation_count = vit->second.no_writers_generation_count;
+    assert(vit != instances_.end());
+    assert(false == change->isRead);
+    ++counters_.samples_unread;
+    bool ret =
+            vit->second->update_state(counters_, change->kind, change->writerGUID,
+                    change->reader_info.writer_ownership_strength);
+    change->reader_info.disposed_generation_count = vit->second->disposed_generation_count;
+    change->reader_info.no_writers_generation_count = vit->second->no_writers_generation_count;
+
+    return ret;
 }
 
 void DataReaderHistory::writer_not_alive(
-        const fastrtps::rtps::GUID_t& writer_guid)
+        const GUID_t& writer_guid)
 {
-    for (auto& it : keyed_changes_)
+    for (auto& it : instances_)
     {
-        it.second.writer_removed(writer_guid);
+        it.second->writer_removed(counters_, writer_guid);
+    }
+}
+
+StateFilter DataReaderHistory::get_mask_status() const noexcept
+{
+    std::lock_guard<RecursiveTimedMutex> guard(*getMutex());
+
+    return {
+        static_cast<SampleStateMask>(
+            (counters_.samples_read ? READ_SAMPLE_STATE : 0) |
+            (counters_.samples_unread ? NOT_READ_SAMPLE_STATE : 0)),
+        static_cast<ViewStateMask>(
+            (counters_.instances_not_new ? NOT_NEW_VIEW_STATE : 0) |
+            (counters_.instances_new ? NEW_VIEW_STATE : 0)),
+        static_cast<InstanceStateMask>(
+            (counters_.instances_alive ? ALIVE_INSTANCE_STATE : 0) |
+            (counters_.instances_disposed ? NOT_ALIVE_DISPOSED_INSTANCE_STATE : 0) |
+            (counters_.instances_no_writers ? NOT_ALIVE_NO_WRITERS_INSTANCE_STATE : 0))
+    };
+}
+
+void DataReaderHistory::writer_update_its_ownership_strength_nts(
+        const GUID_t& writer_guid,
+        const uint32_t ownership_strength)
+{
+    for (auto& instance : instances_)
+    {
+        instance.second->writer_update_its_ownership_strength(writer_guid, ownership_strength);
     }
 }
 

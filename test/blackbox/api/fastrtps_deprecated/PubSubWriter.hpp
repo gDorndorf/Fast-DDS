@@ -576,7 +576,12 @@ public:
     bool waitForAllAcked(
             const std::chrono::duration<_Rep, _Period>& max_wait)
     {
-        return publisher_->wait_for_all_acked(eprosima::fastrtps::Time_t((int32_t)max_wait.count(), 0));
+        auto nsecs = std::chrono::duration_cast<std::chrono::nanoseconds>(max_wait);
+        auto secs = std::chrono::duration_cast<std::chrono::seconds>(nsecs);
+        nsecs -= secs;
+        eprosima::fastrtps::Duration_t timeout {static_cast<int32_t>(secs.count()),
+                                                static_cast<uint32_t>(nsecs.count())};
+        return publisher_->wait_for_all_acked(timeout);
     }
 
     void block_until_discover_topic(
@@ -1068,6 +1073,23 @@ public:
         return *this;
     }
 
+    PubSubWriter& initial_announcements(
+            uint32_t count,
+            const eprosima::fastrtps::Duration_t& period)
+    {
+        participant_attr_.rtps.builtin.discovery_config.initial_announcements.count = count;
+        participant_attr_.rtps.builtin.discovery_config.initial_announcements.period = period;
+        return *this;
+    }
+
+    PubSubWriter& ownership_strength(
+            uint32_t strength)
+    {
+        publisher_attr_.qos.m_ownership.kind = eprosima::fastdds::dds::EXCLUSIVE_OWNERSHIP_QOS;
+        publisher_attr_.qos.m_ownershipStrength.value = strength;
+        return *this;
+    }
+
     PubSubWriter& load_publisher_attr(
             const std::string& xml)
     {
@@ -1141,6 +1163,11 @@ public:
     {
         publisher_attr_.qos.m_partition.clear();
         publisher_attr_.qos.m_partition.push_back(partition.c_str());
+        return publisher_->updateAttributes(publisher_attr_);
+    }
+
+    bool set_qos()
+    {
         return publisher_->updateAttributes(publisher_attr_);
     }
 

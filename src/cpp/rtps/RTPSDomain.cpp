@@ -20,6 +20,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
 #include <regex>
 #include <string>
 #include <thread>
@@ -43,9 +44,9 @@
 #include <rtps/participant/RTPSParticipantImpl.h>
 
 #include <rtps/common/GuidUtils.hpp>
+#include <rtps/network/ExternalLocatorsProcessor.hpp>
 #include <utils/Host.hpp>
 #include <utils/SystemInfo.hpp>
-
 
 namespace eprosima {
 namespace fastrtps {
@@ -167,6 +168,16 @@ RTPSParticipant* RTPSDomain::createParticipant(
     // Generate a new GuidPrefix_t
     GuidPrefix_t guidP;
     guid_prefix_create(ID, guidP);
+    if (!PParam.builtin.metatraffic_external_unicast_locators.empty())
+    {
+        fastdds::rtps::LocatorList locators;
+        fastrtps::rtps::IPFinder::getIP4Address(&locators);
+        fastdds::rtps::ExternalLocatorsProcessor::add_external_locators(locators,
+                PParam.builtin.metatraffic_external_unicast_locators);
+        uint16_t host_id = Host::compute_id(locators);
+        guidP.value[2] = static_cast<octet>(host_id & 0xFF);
+        guidP.value[3] = static_cast<octet>((host_id >> 8) & 0xFF);
+    }
 
     RTPSParticipant* p = new RTPSParticipant(nullptr);
     RTPSParticipantImpl* pimpl = nullptr;
@@ -226,6 +237,13 @@ RTPSParticipant* RTPSDomain::createParticipant(
         m_RTPSParticipants.push_back(t_p_RTPSParticipant(p, pimpl));
     }
 
+    // Check the environment file in case it was modified during participant creation leading to a missed callback.
+    if ((PParam.builtin.discovery_config.discoveryProtocol != DiscoveryProtocol_t::CLIENT) &&
+            RTPSDomainImpl::file_watch_handle_)
+    {
+        pimpl->environment_file_has_changed();
+    }
+
     if (enabled)
     {
         // Start protocols
@@ -240,7 +258,6 @@ bool RTPSDomain::removeRTPSParticipant(
     if (p != nullptr)
     {
         assert((p->mp_impl != nullptr) && "This participant has been previously invalidated");
-        p->mp_impl->disable();
 
         std::unique_lock<std::mutex> lock(m_mutex);
         for (auto it = m_RTPSParticipants.begin(); it != m_RTPSParticipants.end(); ++it)
@@ -263,6 +280,7 @@ bool RTPSDomain::removeRTPSParticipant(
 void RTPSDomain::removeRTPSParticipant_nts(
         RTPSDomain::t_p_RTPSParticipant& participant)
 {
+    participant.second->disable();
     // The destructor of RTPSParticipantImpl already deletes the associated RTPSParticipant and sets
     // its pointer to the RTPSParticipant to nullptr, so there is no need to do it here manually.
     delete(participant.second);
@@ -305,6 +323,39 @@ RTPSWriter* RTPSDomain::createRTPSWriter(
     }
 
     return nullptr;
+}
+
+RTPSWriter* RTPSDomain::createRTPSWriter(
+        RTPSParticipant* p,
+        WriterAttributes& watt,
+        const std::shared_ptr<IPayloadPool>& payload_pool,
+        const std::shared_ptr<IChangePool>& change_pool,
+        WriterHistory* hist,
+        WriterListener* listen)
+{
+    RTPSParticipantImpl* impl = RTPSDomainImpl::find_local_participant(p->getGuid());
+    if (impl)
+    {
+        RTPSWriter* ret_val = nullptr;
+        if (impl->create_writer(&ret_val, watt, payload_pool, change_pool, hist, listen))
+        {
+            return ret_val;
+        }
+    }
+
+    return nullptr;
+}
+
+RTPSWriter* RTPSDomain::createRTPSWriter(
+        RTPSParticipant* p,
+        const EntityId_t& entity_id,
+        WriterAttributes& watt,
+        const std::shared_ptr<IPayloadPool>& payload_pool,
+        const std::shared_ptr<IChangePool>& change_pool,
+        WriterHistory* hist,
+        WriterListener* listen)
+{
+    return RTPSDomainImpl::create_rtps_writer(p, entity_id, watt, payload_pool, change_pool, hist, listen);
 }
 
 RTPSWriter* RTPSDomain::createRTPSWriter(
@@ -459,21 +510,36 @@ RTPSParticipant* RTPSDomain::clientServerEnvironmentCreationOverride(
         return nullptr;
     }
 
-    // we only make the attributes copy when we are sure is worth
+    // We only make the attributes copy when we are sure is worth
+    // Is up to the caller guarantee the att argument is not modified during the call
     RTPSParticipantAttributes client_att(att);
 
     // Retrieve the info from the environment variable
-    // TODO(jlbueno) This should be protected with the PDP mutex.
-    if (load_environment_server_info(client_att.builtin.discovery_config.m_DiscoveryServers) &&
-            client_att.builtin.discovery_config.m_DiscoveryServers.empty())
+    RemoteServerList_t& server_list = client_att.builtin.discovery_config.m_DiscoveryServers;
+    if (load_environment_server_info(server_list) && server_list.empty())
     {
         // it's not an error, the environment variable may not be set. Any issue with environment
         // variable syntax is logError already
         return nullptr;
     }
 
+    // check if some server requires the UDPv6 transport
+    for (auto& server : server_list)
+    {
+        if (server.requires_transport<LOCATOR_KIND_UDPv6>())
+        {
+            // extend builtin transports with the UDPv6 transport
+            auto descriptor = std::make_shared<fastdds::rtps::UDPv6TransportDescriptor>();
+            descriptor->sendBufferSize = client_att.sendSocketBufferSize;
+            descriptor->receiveBufferSize = client_att.listenSocketBufferSize;
+            client_att.userTransports.push_back(std::move(descriptor));
+            break;
+        }
+    }
+
     logInfo(DOMAIN, "Detected auto client-server environment variable."
-            "Trying to create client with the default server setup.");
+            << "Trying to create client with the default server setup: "
+            << client_att.builtin.discovery_config.m_DiscoveryServers);
 
     client_att.builtin.discovery_config.discoveryProtocol = DiscoveryProtocol_t::CLIENT;
     // RemoteServerAttributes already fill in above
@@ -599,8 +665,11 @@ bool RTPSDomainImpl::should_intraprocess_between(
 
 void RTPSDomainImpl::file_watch_callback()
 {
+    auto _1s = std::chrono::seconds(1);
+
     // Ensure that all changes have been saved by the OS
-    std::this_thread::sleep_for(std::chrono::seconds(1));
+    SystemInfo::wait_for_file_closure(SystemInfo::get_environment_file(), _1s);
+
     // For all RTPSParticipantImpl registered in the RTPSDomain, call RTPSParticipantImpl::environment_file_has_changed
     std::lock_guard<std::mutex> guard(RTPSDomain::m_mutex);
     for (auto participant : RTPSDomain::m_RTPSParticipants)

@@ -691,8 +691,13 @@ public:
     bool waitForAllAcked(
             const std::chrono::duration<_Rep, _Period>& max_wait)
     {
+        auto nsecs = std::chrono::duration_cast<std::chrono::nanoseconds>(max_wait);
+        auto secs = std::chrono::duration_cast<std::chrono::seconds>(nsecs);
+        nsecs -= secs;
+        eprosima::fastrtps::Duration_t timeout {static_cast<int32_t>(secs.count()),
+                                                static_cast<uint32_t>(nsecs.count())};
         return (ReturnCode_t::RETCODE_OK ==
-               datawriter_->wait_for_acknowledgments(eprosima::fastrtps::Time_t((int32_t)max_wait.count(), 0)));
+               datawriter_->wait_for_acknowledgments(timeout));
     }
 
     template<class _Rep,
@@ -703,9 +708,13 @@ public:
             const eprosima::fastrtps::rtps::InstanceHandle_t& instance_handle,
             const std::chrono::duration<_Rep, _Period>& max_wait)
     {
+        auto nsecs = std::chrono::duration_cast<std::chrono::nanoseconds>(max_wait);
+        auto secs = std::chrono::duration_cast<std::chrono::seconds>(nsecs);
+        nsecs -= secs;
+        eprosima::fastrtps::Duration_t timeout {static_cast<int32_t>(secs.count()),
+                                                static_cast<uint32_t>(nsecs.count())};
         return (ReturnCode_t::RETCODE_OK ==
-               datawriter_->wait_for_acknowledgments(data, instance_handle,
-               eprosima::fastrtps::Time_t(static_cast<int32_t>(max_wait.count()), 0)));
+               datawriter_->wait_for_acknowledgments(data, instance_handle, timeout));
     }
 
     void block_until_discover_topic(
@@ -1249,6 +1258,23 @@ public:
         return *this;
     }
 
+    PubSubWriter& initial_announcements(
+            uint32_t count,
+            const eprosima::fastrtps::Duration_t& period)
+    {
+        participant_qos_.wire_protocol().builtin.discovery_config.initial_announcements.count = count;
+        participant_qos_.wire_protocol().builtin.discovery_config.initial_announcements.period = period;
+        return *this;
+    }
+
+    PubSubWriter& ownership_strength(
+            uint32_t strength)
+    {
+        datawriter_qos_.ownership().kind = eprosima::fastdds::dds::EXCLUSIVE_OWNERSHIP_QOS;
+        datawriter_qos_.ownership_strength().value = strength;
+        return *this;
+    }
+
     PubSubWriter& load_publisher_attr(
             const std::string& /*xml*/)
     {
@@ -1360,6 +1386,11 @@ public:
         publisher_qos_.partition().clear();
         publisher_qos_.partition().push_back(partition.c_str());
         return (ReturnCode_t::RETCODE_OK == publisher_->set_qos(publisher_qos_));
+    }
+
+    bool set_qos()
+    {
+        return (ReturnCode_t::RETCODE_OK == datawriter_->set_qos(datawriter_qos_));
     }
 
     bool remove_all_changes(

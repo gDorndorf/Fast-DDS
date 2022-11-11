@@ -21,6 +21,7 @@
 #define _FASTDDS_PARTICIPANTIMPL_HPP_
 #ifndef DOXYGEN_SHOULD_SKIP_THIS_PUBLIC
 
+#include <atomic>
 #include <mutex>
 #include <condition_variable>
 
@@ -109,12 +110,14 @@ public:
     ReturnCode_t set_listener(
             DomainParticipantListener* listener)
     {
+        std::lock_guard<std::mutex> _(mtx_gs_);
         listener_ = listener;
         return ReturnCode_t::RETCODE_OK;
     }
 
-    const DomainParticipantListener* get_listener() const
+    DomainParticipantListener* get_listener() const
     {
+        std::lock_guard<std::mutex> _(mtx_gs_);
         return listener_;
     }
 
@@ -329,7 +332,7 @@ public:
 
     DomainId_t get_domain_id() const;
 
-    ReturnCode_t delete_contained_entities();
+    virtual ReturnCode_t delete_contained_entities();
 
     ReturnCode_t assert_liveliness();
 
@@ -395,17 +398,27 @@ public:
     ReturnCode_t get_current_time(
             fastrtps::Time_t& current_time) const;
 
-    const DomainParticipant* get_participant() const;
-
-    DomainParticipant* get_participant();
-
-    const fastrtps::rtps::RTPSParticipant* rtps_participant() const
+    const DomainParticipant* get_participant() const
     {
+        std::lock_guard<std::mutex> _(mtx_gs_);
+        return participant_;
+    }
+
+    DomainParticipant* get_participant()
+    {
+        std::lock_guard<std::mutex> _(mtx_gs_);
+        return participant_;
+    }
+
+    const fastrtps::rtps::RTPSParticipant* get_rtps_participant() const
+    {
+        std::lock_guard<std::mutex> _(mtx_gs_);
         return rtps_participant_;
     }
 
-    fastrtps::rtps::RTPSParticipant* rtps_participant()
+    fastrtps::rtps::RTPSParticipant* get_rtps_participant()
     {
+        std::lock_guard<std::mutex> _(mtx_gs_);
         return rtps_participant_;
     }
 
@@ -466,7 +479,7 @@ public:
     DomainParticipantListener* get_listener_for(
             const StatusMask& status);
 
-    uint32_t& id_counter()
+    std::atomic<uint32_t>& id_counter()
     {
         return id_counter_;
     }
@@ -483,7 +496,7 @@ protected:
     fastrtps::rtps::GUID_t guid_;
 
     //!For instance handle creation
-    uint32_t next_instance_id_;
+    std::atomic<uint32_t> next_instance_id_;
 
     //!Participant Qos
     DomainParticipantQos qos_;
@@ -496,6 +509,9 @@ protected:
 
     //!Participant Listener
     DomainParticipantListener* listener_;
+
+    //! getter/setter mutex
+    mutable std::mutex mtx_gs_;
 
     //!Publisher maps
     std::map<Publisher*, PublisherImpl*> publishers_;
@@ -541,7 +557,7 @@ protected:
     // All parent's child requests
     std::map<fastrtps::rtps::SampleIdentity, std::vector<fastrtps::rtps::SampleIdentity>> parent_requests_;
 
-    uint32_t id_counter_ = 0;
+    std::atomic<uint32_t> id_counter_;
 
     class MyRTPSParticipantListener : public fastrtps::rtps::RTPSParticipantListener
     {

@@ -58,6 +58,11 @@ public:
 
     MOCK_METHOD0(getHistorySize, size_t());
 
+    MOCK_METHOD3(get_change, bool(
+            const SequenceNumber_t& seq,
+            const GUID_t& guid,
+            CacheChange_t** change));
+
     MOCK_METHOD1(get_earliest_change, bool(
             CacheChange_t** change));
 
@@ -121,7 +126,7 @@ public:
         return ret;
     }
 
-    inline RecursiveTimedMutex* getMutex()
+    inline RecursiveTimedMutex* getMutex() const
     {
         return mp_mutex;
     }
@@ -154,6 +159,14 @@ public:
             const GUID_t& /*writer_guid*/,
             const SequenceNumber_t& /*last_notified_seq*/)
     {
+    }
+
+    virtual void writer_update_its_ownership_strength_nts(
+            const GUID_t& writer_guid,
+            const uint32_t ownership_strength)
+    {
+        static_cast<void>(writer_guid);
+        static_cast<void>(ownership_strength);
     }
 
     HistoryAttributes m_att;

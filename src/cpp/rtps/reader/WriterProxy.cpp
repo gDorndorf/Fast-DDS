@@ -17,23 +17,24 @@
  *
  */
 
-#include <fastdds/rtps/builtin/data/WriterProxyData.h>
-
 #include <rtps/reader/WriterProxy.h>
-#include <fastdds/rtps/reader/StatefulReader.h>
-#include <fastrtps/rtps/writer/RTPSWriter.h>
 
 #include <fastdds/dds/log/Log.hpp>
+
+#include <fastdds/rtps/builtin/data/WriterProxyData.h>
+#include <fastdds/rtps/messages/RTPSMessageCreator.h>
+#include <fastdds/rtps/reader/StatefulReader.h>
+#include <fastdds/rtps/resources/TimedEvent.h>
+
 #include <fastrtps/utils/TimeConversion.h>
 
-#include <fastdds/rtps/resources/TimedEvent.h>
-#include <fastdds/rtps/messages/RTPSMessageCreator.h>
+#include <rtps/network/ExternalLocatorsProcessor.hpp>
 #include <rtps/participant/RTPSParticipantImpl.h>
 
 #include "rtps/RTPSDomainImpl.hpp"
 #include "utils/collections/node_size_helpers.hpp"
 
-#if !defined(NDEBUG) && defined(FASTRTPS_SOURCE) && defined(__unix__)
+#if !defined(NDEBUG) && !defined(ANDROID) && defined(FASTRTPS_SOURCE) && defined(__unix__)
 #define SHOULD_DEBUG_LINUX
 #endif // SHOULD_DEBUG_LINUX
 
@@ -99,8 +100,7 @@ WriterProxy::WriterProxy(
             };
     auto acknack_lambda = [this]() -> bool
             {
-                perform_initial_ack_nack();
-                return false;
+                return perform_initial_ack_nack();
             };
 
     heartbeat_response_ = new TimedEvent(event_manager, heartbeat_lambda, 0);
@@ -122,6 +122,8 @@ void WriterProxy::start(
         const SequenceNumber_t& initial_sequence,
         bool is_datasharing)
 {
+    using fastdds::rtps::ExternalLocatorsProcessor::filter_remote_locators;
+
 #ifdef SHOULD_DEBUG_LINUX
     assert(get_mutex_owner() == get_thread_id());
 #endif // SHOULD_DEBUG_LINUX
@@ -139,6 +141,8 @@ void WriterProxy::start(
     liveliness_kind_ = attributes.m_qos.m_liveliness.kind;
     locators_entry_.unicast = attributes.remote_locators().unicast;
     locators_entry_.multicast = attributes.remote_locators().multicast;
+    filter_remote_locators(locators_entry_,
+            reader_->getAttributes().external_unicast_locators, reader_->getAttributes().ignore_non_matching_locators);
     is_datasharing_writer_ = is_datasharing;
     initial_acknack_->restart_timer();
     loaded_from_storage(initial_sequence);
@@ -148,6 +152,8 @@ void WriterProxy::start(
 void WriterProxy::update(
         const WriterProxyData& attributes)
 {
+    using fastdds::rtps::ExternalLocatorsProcessor::filter_remote_locators;
+
 #ifdef SHOULD_DEBUG_LINUX
     assert(get_mutex_owner() == get_thread_id());
 #endif // SHOULD_DEBUG_LINUX
@@ -156,6 +162,8 @@ void WriterProxy::update(
     ownership_strength_ = attributes.m_qos.m_ownershipStrength.value;
     locators_entry_.unicast = attributes.remote_locators().unicast;
     locators_entry_.multicast = attributes.remote_locators().multicast;
+    filter_remote_locators(locators_entry_,
+            reader_->getAttributes().external_unicast_locators, reader_->getAttributes().ignore_non_matching_locators);
 }
 
 void WriterProxy::stop()
@@ -465,23 +473,34 @@ SequenceNumber_t WriterProxy::next_cache_change_to_be_notified()
     return SequenceNumber_t::unknown();
 }
 
-void WriterProxy::perform_initial_ack_nack()
+bool WriterProxy::perform_initial_ack_nack()
 {
-    // Send initial NACK.
-    SequenceNumberSet_t sns(SequenceNumber_t(0, 0));
-    if (is_on_same_process_)
+    bool ret_value = false;
+
+    if (!is_datasharing_writer_)
     {
-        RTPSWriter* writer = RTPSDomainImpl::find_local_writer(guid());
-        if (writer)
+        // Send initial NACK.
+        SequenceNumberSet_t sns(SequenceNumber_t(0, 0));
+        if (is_on_same_process_)
         {
-            bool tmp;
-            writer->process_acknack(guid(), reader_->getGuid(), 1, SequenceNumberSet_t(), false, tmp);
+            RTPSWriter* writer = RTPSDomainImpl::find_local_writer(guid());
+            if (writer)
+            {
+                bool tmp;
+                writer->process_acknack(guid(), reader_->getGuid(), 1, SequenceNumberSet_t(), false, tmp);
+            }
+        }
+        else
+        {
+            if (0 == last_heartbeat_count_)
+            {
+                reader_->send_acknack(this, sns, this, false);
+                ret_value = true;
+            }
         }
     }
-    else
-    {
-        reader_->send_acknack(this, sns, this, false);
-    }
+
+    return ret_value;
 }
 
 void WriterProxy::perform_heartbeat_response()

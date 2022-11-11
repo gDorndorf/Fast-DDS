@@ -30,7 +30,7 @@ endif()
 ###############################################################################
 # Project                                                                     #
 ###############################################################################
-project(fastrtps VERSION "2.7.0" LANGUAGES C CXX)
+project(fastrtps VERSION "2.8.0" LANGUAGES C CXX)
 
 set(PROJECT_NAME_LARGE "Fast RTPS")
 string(TOUPPER "${PROJECT_NAME}" PROJECT_NAME_UPPER)
@@ -57,12 +57,13 @@ if(MSVC OR MSVC_IDE)
     endif()
 
     # make visual studio more gcc and clang like.
-    # C4101 'identifier' : unreferenced local variable 
+    # C4101 'identifier' : unreferenced local variable
     # C4189 'identifier' : local variable is initialized but not referenced
     # C4555  expression has no effect; expected expression with side-effect
     # C4715: 'Test': not all control paths return a value
     # C5038 data member 'member1' will be initialized after data member 'member2'
-    add_compile_options(/w34101 /w34189 /w34555 /w34715 /w35038)
+    # C4100 'identifier' : unreferenced formal parameter (matches clang -Wunused-lambda-capture)
+    add_compile_options(/w34101 /w34189 /w34555 /w34715 /w35038 /w44100)
 
     if(EPROSIMA_BUILD)
         string(REPLACE "/DNDEBUG" "" CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO}")
@@ -94,13 +95,72 @@ endif()
 ###############################################################################
 # Test system configuration
 ###############################################################################
+
 include(${PROJECT_SOURCE_DIR}/cmake/common/check_configuration.cmake)
 
 set(FORCE_CXX "11" CACHE STRING "C++ standard fulfillment selection")
-check_stdcxx()
+check_stdcxx(${FORCE_CXX})
 
-check_compile_feature()
 check_endianness()
+
+###############################################################################
+# Activate Sanitizers
+###############################################################################
+option(SANITIZER "Enable Thread or Address sanitizers" OFF)
+string(TOUPPER ${SANITIZER} SANITIZER)
+
+if (SANITIZER)
+    if(${SANITIZER} STREQUAL "ADDRESS")
+        message(STATUS "Enabling address sanitizer...")
+        # Warning/Error messages
+        if(NOT (CMAKE_BUILD_TYPE STREQUAL "Debug"))
+            message(WARNING "Address sanitizer results with an optimized (non-Debug) build may be misleading")
+        endif()
+
+        if("${CMAKE_C_COMPILER_ID}" MATCHES "(Apple)?[Cc]lang" OR "${CMAKE_CXX_COMPILER_ID}" MATCHES "(Apple)?[Cc]lang")
+            message(STATUS "Building with llvm Address sanitizer Tools")
+
+            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address")
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address")
+
+        elseif(CMAKE_COMPILER_IS_GNUCXX)
+            message(STATUS "Building with Address sanitizer Tools")
+
+            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address -fno-omit-frame-pointer")
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer")
+
+        else()
+            message(FATAL_ERROR "Address sanitizer requires Clang or GCC. Aborting.")
+        endif()
+
+    elseif(${SANITIZER} STREQUAL "THREAD")
+        message(STATUS "Enabling thread sanitizer...")
+        # Warning/Error messages
+        if(NOT (CMAKE_BUILD_TYPE STREQUAL "Debug"))
+            message(WARNING "Thread sanitizer results with an optimized (non-Debug) build may be misleading")
+        endif()
+
+        if("${CMAKE_C_COMPILER_ID}" MATCHES "(Apple)?[Cc]lang" OR "${CMAKE_CXX_COMPILER_ID}" MATCHES "(Apple)?[Cc]lang")
+            message(STATUS "Building with llvm Thread sanitizer Tools")
+
+            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=thread")
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=thread")
+
+        elseif(CMAKE_COMPILER_IS_GNUCXX)
+            message(STATUS "Building with Thread sanitizer Tools")
+
+            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=thread -fno-omit-frame-pointer")
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=thread -fno-omit-frame-pointer")
+
+        else()
+            message(FATAL_ERROR "Thread sanitizer requires Clang or GCC. Aborting.")
+        endif()
+
+    else()
+        message(WARNING "Sanitizer option not supported. Continuing without any code instrumentation... ")
+
+    endif()
+endif()
 
 ###############################################################################
 # Installation paths
@@ -206,6 +266,15 @@ endif()
 
 option(SQLITE3_SUPPORT "Activate SQLITE3 support" ON)
 
+option(USE_THIRDPARTY_SHARED_MUTEX [=[
+Forces the use of a Boost-based shared_mutex implementation
+instead of the framework one. Useful to cope with issues on
+framework implementations like misguided sanitizer reports.
+This implementation will be used by default on frameworks
+lacking the shared_mutex feature like those not fulfilling
+C++17.
+]=] OFF)
+
 ###############################################################################
 # SHM as Default transport
 ###############################################################################
@@ -288,7 +357,7 @@ option(FASTDDS_STATISTICS "Enable Fast DDS Statistics Module" OFF)
 add_subdirectory(src/cpp)
 
 ###############################################################################
-# Add http://optionparser.sourceforge.net/ as unified cli parser 
+# Add http://optionparser.sourceforge.net/ as unified cli parser
 ###############################################################################
 add_subdirectory(thirdparty/optionparser)
 
@@ -402,20 +471,20 @@ if(BUILD_DOCUMENTATION)
 
         file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/readthedocs_custom_template.cmake [=[
 
-            file(DOWNLOAD "https://fast-dds.docs.eprosima.com/_/downloads/en/v${PROJECT_VERSION}/htmlzip/" "eprosima-fast-rtps.zip")
+            file(DOWNLOAD "https://fast-dds.docs.eprosima.com/_/downloads/en/v${PROJECT_VERSION}/htmlzip/" "./eprosima-fast-rtps.zip")
             # TODO: when windows ci CMake version surpasses 17 favor file() instead of UNZIP as in the next line
-            # file(ARCHIVE_EXTRACT INPUT "eprosima-fast-rtps.zip" DESTINATION  "${PROJECT_BINARY_DIR}/doc/")
-            execute_process(COMMAND "${UNZIP_EXE}" "eprosima-fast-rtps.zip" -d "${PROJECT_BINARY_DIR}/doc/")
+            # file(ARCHIVE_EXTRACT INPUT "./eprosima-fast-rtps.zip" DESTINATION  "${PROJECT_BINARY_DIR}/doc/")
+            execute_process(COMMAND "${UNZIP_EXE}" "./eprosima-fast-rtps.zip" -d "${PROJECT_BINARY_DIR}/doc/")
             file(REMOVE_RECURSE "${PROJECT_BINARY_DIR}/doc/manual")
             file(RENAME "${PROJECT_BINARY_DIR}/doc/eprosima-fast-rtps-v${PROJECT_VERSION}" "${PROJECT_BINARY_DIR}/doc/manual")
-            file(REMOVE  "eprosima-fast-rtps.zip")
+            file(REMOVE  "./eprosima-fast-rtps.zip")
 
             ]=])
 
         configure_file(${CMAKE_CURRENT_BINARY_DIR}/readthedocs_custom_template.cmake  ${CMAKE_CURRENT_BINARY_DIR}/readthedocs_custom.cmake)
 
         add_custom_target(readthedocs
-            COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_BINARY_DIR}/readthedocs_custom.cmake 
+            COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_BINARY_DIR}/readthedocs_custom.cmake
             )
 
         add_dependencies(readthedocs docdirs)
@@ -443,7 +512,7 @@ option(INSTALL_EXAMPLES "Install example" OFF)
 
 if(INSTALL_EXAMPLES)
   # Install examples
-  install(DIRECTORY ${PROJECT_SOURCE_DIR}/examples/C++
+  install(DIRECTORY ${PROJECT_SOURCE_DIR}/examples/cpp
       DESTINATION examples/
       COMPONENT examples
       PATTERN "examples/CMakeLists.txt" EXCLUDE
